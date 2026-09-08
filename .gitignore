@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+config/*.json
+!config/*.example.json
+数据/
+.env*
+*.zip
+*.exe
+*.xlsx
+*.csv
