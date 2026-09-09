@@ -63,6 +63,28 @@ class WeimobClient:
             'solutionType': 2, 'pageNum': page, 'pageSize': min(size, 100),
             'queryParameter': query}) or {}
 
+    def all_store_products(self, bos_id, stores, progress=None):
+        records, errors = [], []
+        for store in [s for s in stores if str(s.get('vidType')) == '10']:
+            page, seen, collected = 1, set(), []
+            try:
+                while True:
+                    if progress: progress('%s · 第 %s 页' % (store.get('vidName',''), page))
+                    data = self.products(bos_id, store, page, 100)
+                    rows = data.get('pageList') or []
+                    ids = {str(r['goodsId']) for r in rows}
+                    if rows and ids.issubset(seen):
+                        raise WeimobAPIError('分页重复，请重试该门店')
+                    collected.extend((store,r) for r in rows if str(r['goodsId']) not in seen)
+                    seen.update(ids)
+                    if page * 100 >= int(data.get('totalCount',0)): break
+                    if not rows: raise WeimobAPIError('分页提前结束，请重试该门店')
+                    page += 1
+                records.extend(collected)
+            except WeimobAPIError as exc:
+                errors.append({'store':store,'error':str(exc)})
+        return records, errors
+
     def product_stores(self, bos_id, stores, product, progress=None):
         matches, errors = [], []
         targets = [s for s in stores if str(s.get('vidType')) == '10']

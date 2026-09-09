@@ -9,6 +9,8 @@ from core import ui
 from core.config import load_json, save_json
 from modules.pool_core import PoolProcessor
 from modules.weimob_admin_client import WeimobClient
+from modules.pool_export import export_records
+from modules.pool_filter import matches, cost_bound
 
 
 def display(value):
@@ -21,7 +23,9 @@ def goods_values(row):
     lo, hi = price.get("minSalePrice"), price.get("maxSalePrice")
     sale = display(lo) if lo == hi or hi is None else "%s ～ %s" % (display(lo), display(hi))
     online = row.get("isOnline")
-    return (display(row.get("outerGoodsCode") or row.get("goodsCode")), "未提供",
+    cost_lo, cost_hi = price.get('minCostPrice'), price.get('maxCostPrice')
+    cost = display(cost_lo) if cost_lo == cost_hi else '%s ～ %s' % (display(cost_lo), display(cost_hi))
+    return (display(row.get("outerGoodsCode") or row.get("goodsCode")), cost,
             sale, display(stock.get("goodsStockNum")),
             "未返回" if online is None else ("已上架" if online else "已下架"))
 
@@ -32,6 +36,10 @@ class PoolFrame(tk.Frame):
         self.processor, self.folder = PoolProcessor(), None
         self.client, self.merchants, self.stores = None, [], []
         self.rows, self.loaded = {}, set()
+        self.row_stores = {}
+        self.source_records = []
+        self.full_mode = False
+        self.applied_filters = {}
         self.page, self.total, self.busy = 1, 0, False
         self.events = queue.Queue()
         self.config = load_json("weimob_admin.json", {})
@@ -85,6 +93,24 @@ class PoolFrame(tk.Frame):
         self.button(row, "上一页", lambda: self.load_products(self.page - 1))
         self.button(row, "下一页", lambda: self.load_products(self.page + 1))
         ttk.Label(tab, textvariable=self.page_var).pack(anchor="w")
+        filters = ttk.Frame(tab)
+        filters.pack(fill='x', pady=4)
+        self.filter_store = tk.StringVar()
+        self.cost_low, self.cost_high = tk.StringVar(), tk.StringVar()
+        for label,var,width in [('门店包含',self.filter_store,12),('成本从',self.cost_low,7),('到',self.cost_high,7)]:
+            ttk.Label(filters,text=label).pack(side='left')
+            entry=ttk.Entry(filters,textvariable=var,width=width)
+            entry.pack(side='left',padx=3)
+            self.controls.append((entry,'normal'))
+        self.cost_state=ttk.Combobox(filters,values=['全部成本','有正成本','零成本','成本未返回'],state='readonly',width=11)
+        self.cost_state.current(0)
+        self.cost_state.pack(side='left',padx=3)
+        self.online_state=ttk.Combobox(filters,values=['全部','已上架','已下架'],state='readonly',width=8)
+        self.online_state.current(0)
+        self.online_state.pack(side='left',padx=3)
+        self.controls.extend([(self.cost_state,'readonly'),(self.online_state,'readonly')])
+        self.button(filters,'应用筛选',self.apply_filters)
+        self.button(filters,'重置',self.clear_filters)
         box = ttk.Frame(tab)
         box.pack(fill="both", expand=True, pady=6)
         self.tree = ttk.Treeview(box, columns=("code", "cost", "sale", "stock", "status"), show="tree headings")
@@ -106,7 +132,12 @@ class PoolFrame(tk.Frame):
         row.pack(fill="x")
         self.button(row, "读取选中商品各门店", self.expand_selected_product)
         self.button(row, "查看原始记录", self.show_raw)
-        ttk.Label(tab, text="当前接口支持查询；成本、SKU 明细和编辑写入尚未提供。商城库存与门店库存分开展示。", wraplength=780).pack(anchor="w", pady=6)
+        row = ttk.Frame(tab)
+        row.pack(fill='x', pady=4)
+        self.button(row, '导出当前展示', self.export_visible)
+        self.button(row, '读取全部门店', self.load_all)
+        self.button(row, '导出全部门店成本', self.export_all)
+        ttk.Label(tab, text="成本显示接口最低～最高成本；0 为接口原值，未返回不补零。多规格为区间，尚不支持编辑写入。", wraplength=780).pack(anchor="w", pady=6)
         ttk.Label(tab, textvariable=self.status_var, wraplength=780).pack(anchor="w")
 
     def button(self, parent, label, command):
@@ -220,6 +251,9 @@ class PoolFrame(tk.Frame):
     def reset_rows(self):
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
+        self.row_stores.clear()
+        self.source_records = []
+        self.full_mode = False
         self.loaded.clear()
         self.page, self.total = 1, 0
         self.page_var.set("第 1 页")
@@ -240,12 +274,17 @@ class PoolFrame(tk.Frame):
             for product in data.get("pageList") or []:
                 iid = self.tree.insert("", "end", text=product.get("title") or "未返回名称", values=goods_values(product))
                 self.rows[iid] = product
+                self.row_stores[iid] = store
+                self.source_records.append((store,product))
             self.page_var.set("第 %s 页 · 共 %s 个商品" % (page, self.total))
             self.status_var.set("%s · 已读取本页 %s 个商品" % (store.get("vidName", ""), len(self.rows)))
+            self.apply_filters()
         self._run(lambda: self.client.products(bos, store, page, 50, search, search_type), success, "正在读取商品…")
 
     def expand_selected_product(self, event=None):
         if self.busy:
+            return
+        if self.full_mode:
             return
         selected = self.tree.selection()
         iid = selected[0] if selected else ""
@@ -262,6 +301,11 @@ class PoolFrame(tk.Frame):
                 row = match["product"]
                 child = self.tree.insert(iid, "end", text=match["store"].get("vidName"), values=goods_values(row))
                 self.rows[child] = row
+                self.row_stores[child] = match['store']
+                record=(match['store'],row)
+                key=(str(match['store']['vid']),str(row['goodsId']))
+                if not any((str(s['vid']),str(r['goodsId'])) == key for s,r in self.source_records):
+                    self.source_records.append(record)
             for error in data["errors"]:
                 self.tree.insert(iid, "end", text=error["store"].get("vidName") + "：读取失败", values=("", "", "", "", error["error"]))
             if not data["matches"] and not data["errors"]:
@@ -273,6 +317,89 @@ class PoolFrame(tk.Frame):
                 (data["checked"], len(data["matches"]), len(data["errors"])))
         self._run(lambda: self.client.product_stores(bos, stores, product,
                   lambda value: self.events.put(("progress", None, value))), success, "正在逐店查询同一商品…")
+
+    def filter_values(self):
+        low,high=cost_bound(self.cost_low.get()),cost_bound(self.cost_high.get())
+        if low is not None and high is not None and low > high:
+            raise ValueError('成本起始值不能大于结束值')
+        return dict(low=low,high=high,store=self.filter_store.get().strip(),
+            online=self.online_state.get(),cost_state=self.cost_state.get(),
+            keyword=self.search_var.get().strip(),by_code=self.search_type.current()==1)
+
+    def apply_filters(self):
+        if self.busy: return
+        try: values=self.filter_values()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        records=[(s,r) for s,r in self.source_records if matches(r,s,values)]
+        self.applied_filters = values
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        self.row_stores.clear()
+        self.loaded.clear()
+        groups={}
+        for store,row in records:
+            key=str(row['goodsId'])
+            parent=''
+            if self.full_mode:
+                if key not in groups:
+                    groups[key]=self.tree.insert('','end',text=row.get('title') or '未返回名称',open=False)
+                parent=groups[key]
+            iid=self.tree.insert(parent,'end',text=store.get('vidName','') if parent else row.get('title',''),values=goods_values(row))
+            self.rows[iid]=row
+            self.row_stores[iid]=store
+        scope='全部门店已读取数据' if self.full_mode else '当前页及已读取门店'
+        self.status_var.set('%s：显示 %s / %s 条；成本范围按区间相交筛选。' % (scope,len(records),len(self.source_records)))
+
+    def clear_filters(self):
+        self.filter_store.set('')
+        self.cost_low.set('')
+        self.cost_high.set('')
+        self.search_var.set('')
+        self.cost_state.current(0)
+        self.online_state.current(0)
+        self.apply_filters()
+
+    def load_all(self):
+        if self.busy or not self.client or self.merchant_box.current()<0: return
+        bos,stores=self.bos_id(),list(self.stores)
+        def success(result):
+            records,errors=result
+            self.reset_rows()
+            self.full_mode=True
+            self.source_records=records
+            self.page_var.set('全部门店 · %s 条 · 读取失败 %s 个门店' % (len(records),len(errors)))
+            self.apply_filters()
+            if errors:
+                messagebox.showwarning('部分门店读取失败','\n'.join(e['store'].get('vidName','')+'：'+e['error'] for e in errors))
+        self._run(lambda:self.client.all_store_products(bos,stores,
+            lambda value:self.events.put(('progress',None,value))),success,'正在读取全部门店…')
+
+    def export_visible(self):
+        if self.busy or not self.rows: return
+        path = filedialog.asksaveasfilename(defaultextension='.xlsx', initialfile='商品池当前展示.xlsx')
+        if not path: return
+        records = [(self.row_stores[iid], row) for iid,row in self.rows.items() if self.tree.exists(iid)]
+        merchant = (self.config.get('current_merchant') or {}).get('name','')
+        scope=('全部门店已读取数据的筛选结果' if self.full_mode else '当前页及已读取门店的筛选结果；不代表全量')+'；已应用筛选条件：'+str(self.applied_filters)
+        self._run(lambda: export_records(path,merchant,records,scope=scope),
+                  lambda n:self.status_var.set('已导出 %s 行：%s' % (n,path)), '正在导出当前展示…')
+
+    def export_all(self):
+        if self.busy or not self.client or self.merchant_box.current() < 0: return
+        path = filedialog.asksaveasfilename(defaultextension='.xlsx', initialfile='全部门店商品成本.xlsx')
+        if not path: return
+        bos, stores = self.bos_id(), list(self.stores)
+        merchant = (self.config.get('current_merchant') or {}).get('name','')
+        def work():
+            records, errors = self.client.all_store_products(bos,stores,
+                lambda value:self.events.put(('progress',None,value)))
+            if not records: raise RuntimeError('未读取到商品，未生成文件。' + str([e['error'] for e in errors][:2]))
+            export_records(path,merchant,records,errors,scope='当前商户全部可访问门店，逐店全分页；不受页面搜索条件影响')
+            return len(records),len(errors)
+        self._run(work,lambda result:self.status_var.set('已导出 %s 行，失败 %s 个门店（详见工作表）：%s' % (*result,path)),
+                  '正在读取全部门店，可能需要几分钟…')
 
     def show_raw(self):
         selected = self.tree.selection()
