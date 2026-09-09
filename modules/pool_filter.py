@@ -1,5 +1,6 @@
 """Shared filtering for displayed records and their exports."""
 from decimal import Decimal, InvalidOperation
+from modules.product_status import status_values
 
 def cost_bound(text):
     if not text.strip(): return None
@@ -16,8 +17,10 @@ def matches(row, store, filters):
     if keyword and keyword not in field.casefold(): return False
     if filters.get('store') and filters['store'].casefold() not in str(store.get('vidName','')).casefold(): return False
     state = filters.get('online','全部')
-    if state == '已上架' and row.get('isOnline') is not True: return False
-    if state == '已下架' and row.get('isOnline') is not False: return False
+    pool, online, effective = status_values(row, store)
+    if state != '全部' and state != online: return False
+    if filters.get('pool_state', '全部') not in ('全部', pool): return False
+    if filters.get('effective', '全部') not in ('全部', effective): return False
     price = row.get('goodsPrice') or {}
     lo, hi = price.get('minCostPrice'), price.get('maxCostPrice')
     cost_state = filters.get('cost_state','全部成本')

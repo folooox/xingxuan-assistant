@@ -3,10 +3,11 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+from modules.product_status import status_values
 
 HEADERS = ['商户','查询节点','节点类型','商品ID','商品名称','商品编码','创建门店',
            '最低成本价','最高成本价','成本状态','最低售价','最高售价','接口库存',
-           '上下架状态','可售状态','多规格','查询时间']
+           '门店上下架','接口可售原值','多规格','查询时间', '商城禁售控制', '两级状态判断']
 
 def flag(value):
     return '未返回' if value is None else ('是' if value else '否')
@@ -24,8 +25,9 @@ def export_records(path, merchant, records, errors=(), scope='当前展示'):
         ws.append([merchant, store.get('vidName'), store.get('vidTypeName'), str(row.get('goodsId','')),
             row.get('title'), str(row.get('outerGoodsCode') or row.get('goodsCode') or ''), row.get('createVidName'),
             lo, hi, status, price.get('minSalePrice'), price.get('maxSalePrice'),
-            (row.get('goodsStock') or {}).get('goodsStockNum'), flag(row.get('isOnline')),
-            flag(row.get('isCanSell')), flag(row.get('isMultiSku')), now])
+            (row.get('goodsStock') or {}).get('goodsStockNum'), status_values(row, store)[1],
+            flag(row.get('isCanSell')), flag(row.get('isMultiSku')), now,
+            status_values(row, store)[0], status_values(row, store)[2]])
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             if isinstance(cell.value, str):
@@ -46,6 +48,7 @@ def export_records(path, merchant, records, errors=(), scope='当前展示'):
     notes.append(['成本口径','微盟 goodsPrice.minCostPrice / maxCostPrice 原值；多规格为商品成本区间，不是SKU明细。'])
     notes.append(['零值口径','接口返回0不代表已核实零成本；缺失值留空，不补零。'])
     notes.append(['库存口径','对应查询节点的接口库存，不合计商城和门店库存。'])
+    notes.append(['两级状态','商城 isCanSell 与门店 isOnline 独立；商城禁售优先。两级状态允许不代表有库存或必然能下单。商城未匹配不推断为允许。'])
     notes.append(['数据时间','逐页实时查询，期间商品变化可能导致总数变化。'])
     if errors:
         failed = wb.create_sheet('读取失败')

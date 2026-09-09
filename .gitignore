@@ -10,3 +10,6 @@ config/*.json
 *.exe
 *.xlsx
 *.csv
+*.har
+config/*.tmp
+*.xls

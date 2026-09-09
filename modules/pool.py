@@ -11,23 +11,25 @@ from modules.pool_core import PoolProcessor
 from modules.weimob_admin_client import WeimobClient
 from modules.pool_export import export_records
 from modules.pool_filter import matches, cost_bound
+from modules.product_status import status_values, attach_pool_status
+from modules.pricing import PricingFrame
+from modules.promotions import PromotionsFrame
 
 
 def display(value):
     return "未返回" if value is None or value == "" else str(value)
 
 
-def goods_values(row):
+def goods_values(row, store=None):
     price = row.get("goodsPrice") or {}
     stock = row.get("goodsStock") or {}
     lo, hi = price.get("minSalePrice"), price.get("maxSalePrice")
     sale = display(lo) if lo == hi or hi is None else "%s ～ %s" % (display(lo), display(hi))
-    online = row.get("isOnline")
     cost_lo, cost_hi = price.get('minCostPrice'), price.get('maxCostPrice')
     cost = display(cost_lo) if cost_lo == cost_hi else '%s ～ %s' % (display(cost_lo), display(cost_hi))
     return (display(row.get("outerGoodsCode") or row.get("goodsCode")), cost,
             sale, display(stock.get("goodsStockNum")),
-            "未返回" if online is None else ("已上架" if online else "已下架"))
+            *status_values(row, store))
 
 
 class PoolFrame(tk.Frame):
@@ -44,6 +46,13 @@ class PoolFrame(tk.Frame):
         self.events = queue.Queue()
         self.config = load_json("weimob_admin.json", {})
         self.setup_ui()
+        saved_bos = (self.config.get('current_merchant') or {}).get('bos_id')
+        if saved_bos:
+            try:
+                self.pricing.select_merchant(saved_bos)
+                self.promotions.select_merchant(saved_bos)
+            except ValueError as exc:
+                self.status_var.set(str(exc))
         self.after(100, self._poll)
 
     def setup_ui(self):
@@ -51,6 +60,10 @@ class PoolFrame(tk.Frame):
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True, padx=10, pady=8)
         self._build_live_tab(tabs)
+        self.pricing = PricingFrame(tabs, self)
+        tabs.add(self.pricing, text=' 采购定价核对 ')
+        self.promotions = PromotionsFrame(tabs, self)
+        tabs.add(self.promotions, text=' 活动价格核对 ')
         self._build_merge_tab(tabs)
 
     def _build_live_tab(self, tabs):
@@ -111,12 +124,23 @@ class PoolFrame(tk.Frame):
         self.controls.extend([(self.cost_state,'readonly'),(self.online_state,'readonly')])
         self.button(filters,'应用筛选',self.apply_filters)
         self.button(filters,'重置',self.clear_filters)
+        status_filters = ttk.Frame(tab)
+        status_filters.pack(fill='x', pady=3)
+        ttk.Label(status_filters, text='商城禁售控制').pack(side='left')
+        self.pool_state = ttk.Combobox(status_filters, values=['全部', '允许销售', '商城禁售', '未读取商城状态'], state='readonly', width=18)
+        self.pool_state.current(0)
+        self.pool_state.pack(side='left', padx=4)
+        ttk.Label(status_filters, text='两级状态').pack(side='left')
+        self.effective_state = ttk.Combobox(status_filters, values=['全部', '商城禁售优先', '门店已下架', '两级状态允许', '待核对'], state='readonly', width=18)
+        self.effective_state.current(0)
+        self.effective_state.pack(side='left', padx=4)
+        self.controls.extend([(self.pool_state, 'readonly'), (self.effective_state, 'readonly')])
         box = ttk.Frame(tab)
         box.pack(fill="both", expand=True, pady=6)
-        self.tree = ttk.Treeview(box, columns=("code", "cost", "sale", "stock", "status"), show="tree headings")
+        self.tree = ttk.Treeview(box, columns=("code", "cost", "sale", "stock", "pool", "online", "effective"), show="tree headings")
         self.tree.heading("#0", text="商品 / 门店（双击商品展开）")
         self.tree.column("#0", width=350, minwidth=200)
-        for name, label in zip(("code", "cost", "sale", "stock", "status"), ("编码", "成本", "售价（元）", "接口库存", "状态")):
+        for name, label in zip(("code", "cost", "sale", "stock", "pool", "online", "effective"), ("编码", "成本", "商品销售价（非活动价）", "接口库存", "商城禁售控制", "门店上下架", "两级状态")):
             self.tree.heading(name, text=label)
             self.tree.column(name, width=100, minwidth=65)
         y = ttk.Scrollbar(box, command=self.tree.yview)
@@ -137,7 +161,7 @@ class PoolFrame(tk.Frame):
         self.button(row, '导出当前展示', self.export_visible)
         self.button(row, '读取全部门店', self.load_all)
         self.button(row, '导出全部门店成本', self.export_all)
-        ttk.Label(tab, text="成本显示接口最低～最高成本；0 为接口原值，未返回不补零。多规格为区间，尚不支持编辑写入。", wraplength=780).pack(anchor="w", pady=6)
+        ttk.Label(tab, text="商城禁售优先于门店上架。两级状态允许不代表有库存或必然可下单；未读取商城状态不推断为允许。成本0需核实，多规格为区间；只读不修改。", wraplength=780).pack(anchor="w", pady=6)
         ttk.Label(tab, textvariable=self.status_var, wraplength=780).pack(anchor="w")
 
     def button(self, parent, label, command):
@@ -224,6 +248,8 @@ class PoolFrame(tk.Frame):
         self.stores = []
         self.store_box.set("")
         self.config["current_merchant"] = {"bos_id": bos, "name": self.merchant_box.get()}
+        self.pricing.select_merchant(bos)
+        self.promotions.select_merchant(bos)
         def success(stores):
             self.stores = stores
             self.store_box.configure(values=["%s · %s" % (s.get("vidName", ""), s.get("vidTypeName", "")) for s in stores])
@@ -272,7 +298,7 @@ class PoolFrame(tk.Frame):
             self.reset_rows()
             self.page, self.total = page, int(data.get("totalCount", 0))
             for product in data.get("pageList") or []:
-                iid = self.tree.insert("", "end", text=product.get("title") or "未返回名称", values=goods_values(product))
+                iid = self.tree.insert("", "end", text=product.get("title") or "未返回名称", values=goods_values(product, store))
                 self.rows[iid] = product
                 self.row_stores[iid] = store
                 self.source_records.append((store,product))
@@ -299,7 +325,10 @@ class PoolFrame(tk.Frame):
         def success(data):
             for match in data["matches"]:
                 row = match["product"]
-                child = self.tree.insert(iid, "end", text=match["store"].get("vidName"), values=goods_values(row))
+                parent_store = self.row_stores.get(iid, {})
+                if str(parent_store.get('vidType')) == '5':
+                    row = attach_pool_status([(match['store'], row)], [(parent_store, product)])[0][1]
+                child = self.tree.insert(iid, "end", text=match["store"].get("vidName"), values=goods_values(row, match['store']))
                 self.rows[child] = row
                 self.row_stores[child] = match['store']
                 record=(match['store'],row)
@@ -324,6 +353,7 @@ class PoolFrame(tk.Frame):
             raise ValueError('成本起始值不能大于结束值')
         return dict(low=low,high=high,store=self.filter_store.get().strip(),
             online=self.online_state.get(),cost_state=self.cost_state.get(),
+            pool_state=self.pool_state.get(),effective=self.effective_state.get(),
             keyword=self.search_var.get().strip(),by_code=self.search_type.current()==1)
 
     def apply_filters(self):
@@ -346,7 +376,7 @@ class PoolFrame(tk.Frame):
                 if key not in groups:
                     groups[key]=self.tree.insert('','end',text=row.get('title') or '未返回名称',open=False)
                 parent=groups[key]
-            iid=self.tree.insert(parent,'end',text=store.get('vidName','') if parent else row.get('title',''),values=goods_values(row))
+            iid=self.tree.insert(parent,'end',text=store.get('vidName','') if parent else row.get('title','') + ' · ' + store.get('vidName',''),values=goods_values(row, store))
             self.rows[iid]=row
             self.row_stores[iid]=store
         scope='全部门店已读取数据' if self.full_mode else '当前页及已读取门店'
@@ -359,11 +389,20 @@ class PoolFrame(tk.Frame):
         self.search_var.set('')
         self.cost_state.current(0)
         self.online_state.current(0)
+        self.pool_state.current(0)
+        self.effective_state.current(0)
         self.apply_filters()
 
     def load_all(self):
-        if self.busy or not self.client or self.merchant_box.current()<0: return
+        if self.busy: return
+        if not self.client or self.merchant_box.current()<0:
+            self.status_var.set('请先在“微盟商品池”点击连接并选择商户，再刷新全部门店。')
+            return
         bos,stores=self.bos_id(),list(self.stores)
+        malls=[s for s in stores if str(s.get('vidType')) == '5']
+        if len(malls) != 1:
+            messagebox.showinfo('需确认商城', '当前商户不止一个或没有商城节点，不能跨商城合并禁售状态。请先联系维护者确认范围。')
+            return
         def success(result):
             records,errors=result
             self.reset_rows()
@@ -371,9 +410,11 @@ class PoolFrame(tk.Frame):
             self.source_records=records
             self.page_var.set('全部门店 · %s 条 · 读取失败 %s 个门店' % (len(records),len(errors)))
             self.apply_filters()
+            self.pricing.update_catalog(records, '全部可访问门店；失败节点 %s 个' % len(errors))
+            self.promotions.refresh()
             if errors:
                 messagebox.showwarning('部分门店读取失败','\n'.join(e['store'].get('vidName','')+'：'+e['error'] for e in errors))
-        self._run(lambda:self.client.all_store_products(bos,stores,
+        self._run(lambda:self.client.catalog_with_status(bos,stores,malls[0],
             lambda value:self.events.put(('progress',None,value))),success,'正在读取全部门店…')
 
     def export_visible(self):
@@ -391,9 +432,13 @@ class PoolFrame(tk.Frame):
         path = filedialog.asksaveasfilename(defaultextension='.xlsx', initialfile='全部门店商品成本.xlsx')
         if not path: return
         bos, stores = self.bos_id(), list(self.stores)
+        malls=[s for s in stores if str(s.get('vidType')) == '5']
+        if len(malls) != 1:
+            self.status_var.set('需要唯一商城节点才能核对两级状态')
+            return
         merchant = (self.config.get('current_merchant') or {}).get('name','')
         def work():
-            records, errors = self.client.all_store_products(bos,stores,
+            records, errors = self.client.catalog_with_status(bos,stores,malls[0],
                 lambda value:self.events.put(('progress',None,value)))
             if not records: raise RuntimeError('未读取到商品，未生成文件。' + str([e['error'] for e in errors][:2]))
             export_records(path,merchant,records,errors,scope='当前商户全部可访问门店，逐店全分页；不受页面搜索条件影响')
@@ -426,6 +471,7 @@ class PoolFrame(tk.Frame):
         self.merchant_box.configure(values=[])
         self.store_box.configure(values=[])
         self.reset_rows()
+        self.promotions.clear_session()
         self.status_var.set("已清除本机连接配置。")
 
     # -------------------- 原 Excel 合并功能 --------------------

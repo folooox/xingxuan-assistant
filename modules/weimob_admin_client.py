@@ -66,24 +66,46 @@ class WeimobClient:
     def all_store_products(self, bos_id, stores, progress=None):
         records, errors = [], []
         for store in [s for s in stores if str(s.get('vidType')) == '10']:
-            page, seen, collected = 1, set(), []
             try:
-                while True:
-                    if progress: progress('%s · 第 %s 页' % (store.get('vidName',''), page))
-                    data = self.products(bos_id, store, page, 100)
-                    rows = data.get('pageList') or []
-                    ids = {str(r['goodsId']) for r in rows}
-                    if rows and ids.issubset(seen):
-                        raise WeimobAPIError('分页重复，请重试该门店')
-                    collected.extend((store,r) for r in rows if str(r['goodsId']) not in seen)
-                    seen.update(ids)
-                    if page * 100 >= int(data.get('totalCount',0)): break
-                    if not rows: raise WeimobAPIError('分页提前结束，请重试该门店')
-                    page += 1
-                records.extend(collected)
+                records.extend(self.all_node_products(bos_id, store, progress))
             except WeimobAPIError as exc:
                 errors.append({'store':store,'error':str(exc)})
         return records, errors
+
+    def all_node_products(self, bos_id, store, progress=None):
+        """Read every page, fail closed on incomplete/repeating responses."""
+        records, seen, page = [], set(), 1
+        while True:
+            if progress:
+                progress('%s · 第 %s 页' % (store.get('vidName', ''), page))
+            data = self.products(bos_id, store, page, 100)
+            rows = data.get('pageList') or []
+            if 'totalCount' not in data:
+                raise WeimobAPIError('未返回总数，无法确认读取完整性')
+            ids = {str(r['goodsId']) for r in rows}
+            if len(ids) != len(rows) or ids.intersection(seen):
+                raise WeimobAPIError('分页商品有重复，未采用不完整结果')
+            if rows and ids.issubset(seen):
+                raise WeimobAPIError('分页重复，未采用不完整结果')
+            records.extend((store, r) for r in rows if str(r['goodsId']) not in seen)
+            seen.update(ids)
+            total = int(data['totalCount'])
+            if len(seen) >= total:
+                return records
+            if not rows or page * 100 >= total:
+                raise WeimobAPIError('分页数量不一致，请重试')
+            page += 1
+
+    def catalog_with_status(self, bos_id, stores, mall, progress=None):
+        from modules.product_status import attach_pool_status
+        errors = []
+        try:
+            mall_records = self.all_node_products(bos_id, mall, progress)
+        except WeimobAPIError as exc:
+            mall_records = []
+            errors.append({'store': mall, 'error': '商城禁售状态读取失败：' + str(exc)})
+        records, store_errors = self.all_store_products(bos_id, stores, progress)
+        return attach_pool_status(records, mall_records), errors + store_errors
 
     def product_stores(self, bos_id, stores, product, progress=None):
         matches, errors = [], []
